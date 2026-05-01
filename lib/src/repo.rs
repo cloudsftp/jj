@@ -397,7 +397,7 @@ pub type SubmoduleStoreInitializer<'a> =
     dyn Fn(&UserSettings, &Path) -> Result<Box<dyn SubmoduleStore>, BackendInitError> + 'a;
 
 type BackendFactory =
-    Box<dyn Fn(&UserSettings, &Path) -> Result<Box<dyn Backend>, BackendLoadError>>;
+    Box<dyn Fn(&UserSettings, &Path, Option<&Path>) -> Result<Box<dyn Backend>, BackendLoadError>>;
 type OpStoreFactory = Box<
     dyn Fn(&UserSettings, &Path, RootOperationData) -> Result<Box<dyn OpStore>, BackendLoadError>,
 >;
@@ -436,21 +436,25 @@ impl Default for StoreFactories {
         // Backends
         factories.add_backend(
             SimpleBackend::name(),
-            Box::new(|_settings, store_path| Ok(Box::new(SimpleBackend::load(store_path)))),
+            Box::new(|_settings, store_path, _workspace_root| {
+                Ok(Box::new(SimpleBackend::load(store_path)))
+            }),
         );
         #[cfg(feature = "git")]
         factories.add_backend(
             crate::git_backend::GitBackend::name(),
-            Box::new(|settings, store_path| {
-                Ok(Box::new(crate::git_backend::GitBackend::load(
-                    settings, store_path,
+            Box::new(|settings, store_path, workspace_root| {
+                Ok(Box::new(crate::git_backend::GitBackend::load_at_workspace(
+                    settings,
+                    store_path,
+                    workspace_root,
                 )?))
             }),
         );
         #[cfg(feature = "testing")]
         factories.add_backend(
             crate::secret_backend::SecretBackend::name(),
-            Box::new(|settings, store_path| {
+            Box::new(|settings, store_path, _workspace_root| {
                 Ok(Box::new(crate::secret_backend::SecretBackend::load(
                     settings, store_path,
                 )?))
@@ -543,6 +547,7 @@ impl StoreFactories {
         &self,
         settings: &UserSettings,
         store_path: &Path,
+        workspace_root: Option<&Path>,
     ) -> Result<Box<dyn Backend>, StoreLoadError> {
         let backend_type = read_store_type("commit", store_path.join("type"))?;
         let backend_factory = self.backend_factories.get(&backend_type).ok_or_else(|| {
@@ -551,7 +556,7 @@ impl StoreFactories {
                 store_type: backend_type.clone(),
             }
         })?;
-        Ok(backend_factory(settings, store_path)?)
+        Ok(backend_factory(settings, store_path, workspace_root)?)
     }
 
     pub fn add_op_store(&mut self, name: &str, factory: OpStoreFactory) {
@@ -700,15 +705,20 @@ impl RepoLoader {
     /// Creates a `RepoLoader` for the repo at `repo_path` by reading the
     /// various `.jj/repo/<backend>/type` files and loading the right
     /// backends from `store_factories`.
+    ///
+    /// If `workspace_root` is provided, backends that support colocation (like
+    /// GitBackend) can detect whether the workspace is colocated and configure
+    /// themselves appropriately.
     pub fn init_from_file_system(
         settings: &UserSettings,
         repo_path: &Path,
         store_factories: &StoreFactories,
+        workspace_root: Option<&Path>,
     ) -> Result<Self, StoreLoadError> {
         let merge_options =
             MergeOptions::from_settings(settings).map_err(|err| BackendLoadError(err.into()))?;
         let store = Store::new(
-            store_factories.load_backend(settings, &repo_path.join("store"))?,
+            store_factories.load_backend(settings, &repo_path.join("store"), workspace_root)?,
             Signer::from_settings(settings)?,
             merge_options,
         );
@@ -1870,6 +1880,17 @@ impl MutableRepo {
         self.view_mut().set_git_head_target(target);
     }
 
+    /// Returns the per-workspace Git HEAD target for the given workspace.
+    pub fn get_workspace_git_head(&self, name: &WorkspaceName) -> RefTarget {
+        self.view
+            .with_ref(|v| v.get_workspace_git_head(name).clone())
+    }
+
+    /// Sets the per-workspace Git HEAD target.
+    pub fn set_workspace_git_head(&mut self, name: &WorkspaceName, target: RefTarget) {
+        self.view_mut().set_workspace_git_head(name, target);
+    }
+
     pub fn set_view(&mut self, data: op_store::View) {
         self.view_mut().set_view(data);
         self.view.mark_dirty();
@@ -1962,6 +1983,18 @@ impl MutableRepo {
             other.git_head(),
         )?;
         self.set_git_head_target(new_git_head_target);
+
+        // Merge per-workspace Git HEADs
+        let changed_workspace_git_heads = diff_named_ref_targets(
+            base.workspace_git_heads().iter().map(|(k, v)| (&**k, v)),
+            other.workspace_git_heads().iter().map(|(k, v)| (&**k, v)),
+        );
+        for (name, (base_target, other_target)) in changed_workspace_git_heads {
+            let self_target = self.get_workspace_git_head(name);
+            let new_target =
+                merge_ref_targets(self.index(), &self_target, base_target, other_target)?;
+            self.set_workspace_git_head(name, new_target);
+        }
 
         Ok(())
     }
